@@ -6,8 +6,11 @@ import os.path as osp
 import pdb
 import random
 import sys
-from operator import le
 from collections import Counter
+from itertools import *
+from operator import le
+from shutil import copyfile
+
 import numpy as np
 import pandas as pd
 import torch
@@ -20,15 +23,18 @@ from torch._C import device
 from torch.nn.modules import padding
 from torch.nn.modules.activation import PReLU
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
+
 import loss
 import network
 from data_list import ImageList, ImageList_idx, Listset
-from itertools import *
-from loss import CrossEntropy
 from infer_semantics_and_obtain_UTR import infer_semantics_and_obtain_UTR
+from loss import CrossEntropy
+from randaug import RandAugmentMC
+
+
 def op_copy(optimizer):
     for param_group in optimizer.param_groups:
         param_group['lr0'] = param_group['lr']
@@ -45,7 +51,7 @@ def lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
     return optimizer
 
 
-from randaug import RandAugmentMC
+
 
 
 def image_train2(resize_size=256, crop_size=224, alexnet=False):
@@ -173,18 +179,19 @@ def load_network1(pre,network1):
     network1.load_state_dict(pre1)
     #network.load_state_dict(pra)
     return network1
-from loss import CrossEntropyLabelSmooth
 
 
 
 
-from loss import CrossEntropy
+
 def train_target(args):
     dset_loaders,dsets = data_load(args)
+
     #target model
     netF_T = network.ResBase(res_name=args.net).cuda()
     netB_T = network.feat_bootleneck(type=args.classifier, feature_dim=netF_T.in_features, bottleneck_dim=args.bottleneck).cuda()
     netC = network.feat_classifier(type=args.layer, class_num = args.class_num, bottleneck_dim=args.bottleneck).cuda()
+    
     #source model
     netF_S = network.ResBase(res_name=args.net).cuda()
     netB_S = network.feat_bootleneck(type=args.classifier, feature_dim=netF_T.in_features, bottleneck_dim=args.bottleneck).cuda()
@@ -200,13 +207,9 @@ def train_target(args):
     netB_S.load_state_dict(torch.load(modelpath))
     modelpath = args.output_dir_src + '/source_C.pt'    
     netC.load_state_dict(torch.load(modelpath))
-    #the model for uncertainty measuring
-    netF1 = network.ResBase(res_name=args.net).cuda()
-    netFS1 = network.ResBase(res_name=args.net).cuda()
-    netC = network.feat_classifier(type=args.layer, class_num = args.class_num, bottleneck_dim=args.bottleneck).cuda()
-    netC1 = network.feat_classifier(type=args.layer, class_num = args.class_num, bottleneck_dim=args.bottleneck).cuda()
-    netBS1 = network.feat_bootleneck(type=args.classifier, feature_dim=netF_T.in_features, bottleneck_dim=args.bottleneck).cuda()
-    
+
+
+
     
     
 
@@ -467,11 +470,8 @@ def train_target(args):
                     outputs_test = netC(features_test)
                     
               
-                    with torch.no_grad():
-                
-                        features_testS1 =(netBS1(netFS1(inputs_test)))
-                        features_testS = (netB_S(netF_S(inputs_test)))
-                        uncs=get_mean(features_testS1,features_testS).cuda()
+                    with torch.no_grad():      
+                        features_testS = (netB_S(netF_S(inputs_test)))             
                     kdloss =torch.nn.MSELoss(reduce=False, size_average=False)(features_test,features_testS)
                     kdloss=torch.mean(kdloss*UTR_D) 
                     
@@ -525,29 +525,14 @@ def train_target(args):
 def lrchange(weight,lr):
     assert weight.shape[0]==len(lr)
     for i in range(weight.shape[0]):
-        # if lr[i]>0.2:
-        #     lr[i]==0.2
-        # if lr[i]<0.05:
-        
-        #     lr[i]=0.05
+      
         lr[i]=np.log(1+lr[i])
         weight[i]*=(lr[i])
     return weight
 
 
 
-def pseduo_aug(predict,counter):
-    a=max(counter.values())
-    b=min(counter.values())
-    #pdb.set_trace()
-    for i in range(0,12):
-        if i not in counter.keys():
-            predict[:,i]=predict[:,i]*1.5
-        else:
-            #pass
-            predict[:,i]=predict[:,i]#*(counter[i]-b+1)*(a-b+1)*1.01
-    predict=nn.functional.normalize(predict,dim=1)
-    return predict
+
 
 
 
@@ -689,7 +674,7 @@ if __name__ == "__main__":
             os.system('mkdir -p ' + args.output_dir)
         if not osp.exists(args.output_dir):
             os.mkdir(args.output_dir)
-        from shutil import copyfile
+        
         copyfile('./six_visda.py', f'./{args.output_dir}/six_visda.py')
         args.savename = 'par_' + str(args.cls_par)
         
