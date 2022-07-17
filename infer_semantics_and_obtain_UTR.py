@@ -10,14 +10,13 @@ def sa(netF):#sensitivity analysis for measuring uncertainty
     netF_perturbed = network.ResBase(res_name="resnet101").cuda()
     
     netF_perturbed.load_state_dict(netF.state_dict())
-    pre1=netF_perturbed.state_dict()
-    #pre1=pre.copy()#{k:v for k,v in pre.items()}
-    for k,v, in pre1.items():
+    state=netF_perturbed.state_dict()
+    for k,v, in state.items():
         #pdb.set_trace()
-            a=torch.rand_like(pre1[k],dtype=torch.float)
+            a=torch.rand_like(state[k],dtype=torch.float)
             a=(a-0.5)/10+1
-            pre1[k]=torch.mul(pre1[k],a)
-    netF_perturbed.load_state_dict(pre1)
+            state[k]=torch.mul(state[k],a)
+    netF_perturbed.load_state_dict(state)
     #network.load_state_dict(pra)
     return netF_perturbed
 
