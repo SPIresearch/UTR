@@ -356,7 +356,7 @@ if __name__ == "__main__":
     # torch.backends.cudnn.deterministic = True
     for k in range(3):
         args.s=k
-        folder = '/home/spi/peijiangbo/'
+        folder = './data'
         args.s_dset_path = folder + args.dset + '/' + names[args.s] + '_list.txt'
         args.test_dset_path = folder + args.dset + '/' + names[args.t] + '_list.txt'     
 
