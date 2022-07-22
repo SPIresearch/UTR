@@ -655,7 +655,7 @@ if __name__ == "__main__":
             continue
         args.t = i
 
-        folder = '/home/spi/peijiangbo/'
+        folder = './data'
         args.s_dset_path = folder + args.dset + '/' + names[args.s] + '_list.txt'
         args.t_dset_path = folder + args.dset + '/' + names[args.t] + '_list.txt'
         args.test_dset_path = folder + args.dset + '/' + names[args.t] + '_list.txt'
