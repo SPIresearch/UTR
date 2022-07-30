@@ -32,7 +32,7 @@ import network
 from data_list import ImageList, ImageList_idx, Listset
 from infer_semantics_and_obtain_UTR import infer_semantics_and_obtain_UTR
 from loss import CrossEntropy
-from randaug import RandAugmentMC
+
 
 
 def op_copy(optimizer):
@@ -66,7 +66,7 @@ def image_train2(resize_size=256, crop_size=224, alexnet=False):
         transforms.RandomCrop(crop_size),
         #transforms.RandomHorizontalFlip(),
         #transforms.ColorJitter(0.3,0.3,0.3,0.01),
-        RandAugmentMC(n=2, m=10),
+        #RandAugmentMC(n=2, m=10),
         transforms.ToTensor(),
         normalize
     ])
@@ -242,47 +242,7 @@ def train_target(args):
     tc=0.000001
     tp=0.9
     start=True
-    epoch=0
-
-    while epoch<10:
-        epoch+=1
-        iter_num=0
-        lr_scheduler(optimizer, iter_num=epoch, max_iter=args.max_epoch)
-        while iter_num*args.batch_size < 55388:
-            try:
-                [inputs_test,inputs_testa], label, tar_idx = iter_test.next()
-            except:
-                alllist=range(55388)
-        
-                dset_all=Listset(dsets["target"],alllist)
-                dset_all=DataLoader(dset_all, batch_size=args.batch_size, shuffle=True, drop_last=True)
-                iter_test = iter(dset_all)
-                [inputs_test,inputs_testa], label, tar_idx = iter_test.next()
-
-            if inputs_test.size(0) == 1:
-                continue
-            
-            inputs_test = inputs_test.cuda()
-            iter_num += 1
-
-            features_test = netB_T(netF_T(inputs_test))
-            outputs_test = netC(features_test)
-
-           
-
-            
-            softmax_out = nn.Softmax(dim=1)(outputs_test)
-            entropy_loss = torch.mean(loss.Entropy(softmax_out))
-            
-            msoftmax = softmax_out.mean(dim=0)
-            gentropy_loss = torch.sum(-msoftmax * torch.log(msoftmax + args.epsilon))
-            entropy_loss -= gentropy_loss
-            im_loss = entropy_loss 
-               
-
-            optimizer.zero_grad()
-            im_loss.backward()
-            optimizer.step()
+    
     epoch=0
 
 
@@ -498,10 +458,7 @@ def train_target(args):
         if args.dset=='VISDA-C':
             acc_s_te, acc_list = cal_acc(dset_loaders['test'], netF_T, netB_T, netC, True)
             log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name, iter_num, args.max_epoch, acc_s_te) + '\n' + acc_list
-        else:
-            
-            acc_s_te, _ = cal_acc(dset_loaders['test'], netF_T, netB_T, netC, False)
-            log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name, epoch, args.max_epoch, acc_s_te)
+        
 
 
         args.out_file.write(log_str + '\n')
@@ -522,20 +479,6 @@ def train_target(args):
         torch.save(netC.state_dict(), osp.join(args.output_dir, "target_C_" + args.savename + ".pt"))
 
     return netF_T, netB_T, netC
-def lrchange(weight,lr):
-    assert weight.shape[0]==len(lr)
-    for i in range(weight.shape[0]):
-      
-        lr[i]=np.log(1+lr[i])
-        weight[i]*=(lr[i])
-    return weight
-
-
-
-
-
-
-
 
 
 def print_args(args):
