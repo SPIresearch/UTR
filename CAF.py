@@ -64,9 +64,7 @@ def image_train2(resize_size=256, crop_size=224, alexnet=False):
         transforms.Resize((resize_size, resize_size)),
         #transforms.RandomRotation(10),
         transforms.RandomCrop(crop_size),
-        #transforms.RandomHorizontalFlip(),
-        #transforms.ColorJitter(0.3,0.3,0.3,0.01),
-        #RandAugmentMC(n=2, m=10),
+      
         transforms.ToTensor(),
         normalize
     ])
