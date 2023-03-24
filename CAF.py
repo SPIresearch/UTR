@@ -6,11 +6,8 @@ import os.path as osp
 import pdb
 import random
 import sys
-from collections import Counter
-from itertools import *
 from operator import le
-from shutil import copyfile
-
+from collections import Counter
 import numpy as np
 import pandas as pd
 import torch
@@ -23,23 +20,18 @@ from torch._C import device
 from torch.nn.modules import padding
 from torch.nn.modules.activation import PReLU
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm import tqdm
-
+from torch.utils.tensorboard import SummaryWriter
 import loss
 import network
 from data_list import ImageList, ImageList_idx, Listset
-from infer_semantics_and_obtain_UTR import infer_semantics_and_obtain_UTR
-from loss import CrossEntropy
-
-
+from itertools import *
 
 def op_copy(optimizer):
     for param_group in optimizer.param_groups:
         param_group['lr0'] = param_group['lr']
     return optimizer
-
 
 def lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
     decay = (1 + gamma * iter_num / max_iter) ** (-power)
@@ -52,22 +44,6 @@ def lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
 
 
 
-
-
-def image_train2(resize_size=256, crop_size=224, alexnet=False):
-  if not alexnet:
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                   std=[0.229, 0.224, 0.225])
-  else:
-    normalize = Normalize(meanfile='./ilsvrc_2012_mean.npy')
-  return  transforms.Compose([
-        transforms.Resize((resize_size, resize_size)),
-        #transforms.RandomRotation(10),
-        transforms.RandomCrop(crop_size),
-      
-        transforms.ToTensor(),
-        normalize
-    ])
 
 def image_train(resize_size=256, crop_size=224, alexnet=False):
   if not alexnet:
@@ -85,6 +61,25 @@ def image_train(resize_size=256, crop_size=224, alexnet=False):
     ])
 
 
+from randaug import RandAugmentMC
+
+
+def aug_mix(resize_size=256, crop_size=224, alexnet=False):
+  if not alexnet:
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                   std=[0.229, 0.224, 0.225])
+  else:
+    normalize = Normalize(meanfile='./ilsvrc_2012_mean.npy')
+  return  transforms.Compose([
+        transforms.Resize((resize_size, resize_size)),
+        #transforms.RandomRotation(10),
+        transforms.RandomCrop(crop_size),
+        #transforms.RandomHorizontalFlip(),
+        #transforms.ColorJitter(0.3,0.3,0.3,0.01),
+        RandAugmentMC(n=2, m=10),
+        transforms.ToTensor(),
+        normalize
+    ])
 
 def image_test(resize_size=256, crop_size=224, alexnet=False):
   if not alexnet:
@@ -107,33 +102,16 @@ def data_load(args):
     txt_tar = open(args.t_dset_path).readlines()
     txt_test = open(args.test_dset_path).readlines()
 
-    if not args.da == 'uda':
-        label_map_s = {}
-        for i in range(len(args.src_classes)):
-            label_map_s[args.src_classes[i]] = i
+    
 
-        new_tar = []
-        for i in range(len(txt_tar)):
-            rec = txt_tar[i]
-            reci = rec.strip().split(' ')
-            if int(reci[1]) in args.tar_classes:
-                if int(reci[1]) in args.src_classes:
-                    line = reci[0] + ' ' + str(label_map_s[int(reci[1])]) + '\n'   
-                    new_tar.append(line)
-                else:
-                    line = reci[0] + ' ' + str(len(label_map_s)) + '\n'   
-                    new_tar.append(line)
-        txt_tar = new_tar.copy()
-        txt_test = txt_tar.copy()
-
-    dsets["target"] = ImageList_idx(txt_tar, transform=image_train(),transform1=image_train2())
+    dsets["target"] = ImageList_idx(txt_tar, transform=image_train(),transform1=aug_mix())
     dset_loaders["target"] = DataLoader(dsets["target"], batch_size=train_bs, shuffle=False, num_workers=args.worker, drop_last=False)
     dsets["test"] = ImageList_idx(txt_test, transform=image_test())
     dset_loaders["test"] = DataLoader(dsets["test"], batch_size=train_bs, shuffle=False, num_workers=args.worker, drop_last=False)
 
     return dset_loaders,dsets
 
-def cal_acc(loader, netF_T, netB_T, netC, flag=False):
+def cal_acc(loader, netF, netB, netC, flag=False):
     start_test = True
     with torch.no_grad():
         iter_test = iter(loader)
@@ -142,7 +120,7 @@ def cal_acc(loader, netF_T, netB_T, netC, flag=False):
             inputs = data[0]
             labels = data[1]
             inputs = inputs.cuda()
-            outputs = netC(netB_T(netF_T(inputs)))
+            outputs = netC(netB(netF(inputs)))
             if start_test:
                 all_output = outputs.float().cpu()
                 all_label = labels.float()
@@ -164,7 +142,9 @@ def cal_acc(loader, netF_T, netB_T, netC, flag=False):
     else:
         return accuracy*100, mean_ent
 
-def load_network1(pre,network1):
+
+
+def capture_unc(pre,network1):
     #pre=network.state_dict().copy()
     network1.load_state_dict(pre)
     pre1=network1.state_dict()
@@ -177,208 +157,258 @@ def load_network1(pre,network1):
     network1.load_state_dict(pre1)
     #network.load_state_dict(pra)
     return network1
+from loss import CrossEntropyLabelSmooth
 
 
 
-
-
+from loss import CrossEntropy1
 def train_target(args):
     dset_loaders,dsets = data_load(args)
-
-    #target model
-    netF_T = network.ResBase(res_name=args.net).cuda()
-    netB_T = network.feat_bootleneck(type=args.classifier, feature_dim=netF_T.in_features, bottleneck_dim=args.bottleneck).cuda()
+    writer = SummaryWriter(comment=f'image_mttwoset_kl')
+    ## set base network
+    if args.net[0:3] == 'res':
+        netF = network.ResBase(res_name=args.net).cuda()
+        netF1 = network.ResBase(res_name=args.net).cuda()
+        netFS = network.ResBase(res_name=args.net).cuda()
+        netFS1 = network.ResBase(res_name=args.net).cuda()
+        netF_f = network.ResBase(res_name=args.net).cuda()
+    elif args.net[0:3] == 'vgg':
+        netF = network.VGGBase(vgg_name=args.net).cuda()  
+        netF1 = network.VGGBase(vgg_name=args.net).cuda() 
+    netB_f = network.feat_bootleneck(type=args.classifier, feature_dim=netF.in_features, bottleneck_dim=args.bottleneck).cuda()
+    netB = network.feat_bootleneck(type=args.classifier, feature_dim=netF.in_features, bottleneck_dim=args.bottleneck).cuda()
     netC = network.feat_classifier(type=args.layer, class_num = args.class_num, bottleneck_dim=args.bottleneck).cuda()
-    
-    #source model
-    netF_S = network.ResBase(res_name=args.net).cuda()
-    netB_S = network.feat_bootleneck(type=args.classifier, feature_dim=netF_T.in_features, bottleneck_dim=args.bottleneck).cuda()
-    
-    #load_state_dict
+    netB1 = network.feat_bootleneck(type=args.classifier, feature_dim=netF.in_features, bottleneck_dim=args.bottleneck).cuda()
+    netC1 = network.feat_classifier(type=args.layer, class_num = args.class_num, bottleneck_dim=args.bottleneck).cuda()
+    netBS = network.feat_bootleneck(type=args.classifier, feature_dim=netF.in_features, bottleneck_dim=args.bottleneck).cuda()
+    netCS = network.feat_classifier(type=args.layer, class_num = args.class_num, bottleneck_dim=args.bottleneck).cuda()
+    netBS1 = network.feat_bootleneck(type=args.classifier, feature_dim=netF.in_features, bottleneck_dim=args.bottleneck).cuda()
+    netCS1 = network.feat_classifier(type=args.layer, class_num = args.class_num, bottleneck_dim=args.bottleneck).cuda()
     modelpath = args.output_dir_src + '/source_F.pt'   
     
-    netF_T.load_state_dict(torch.load(modelpath))
-    netF_S.load_state_dict(torch.load(modelpath))
-    
+    netF.load_state_dict(torch.load(modelpath))
+    netF1.load_state_dict(torch.load(modelpath))
+    netFS.load_state_dict(torch.load(modelpath))
+    netFS1.load_state_dict(torch.load(modelpath))
     modelpath = args.output_dir_src + '/source_B.pt'   
-    netB_T.load_state_dict(torch.load(modelpath))
-    netB_S.load_state_dict(torch.load(modelpath))
+    netB.load_state_dict(torch.load(modelpath))
+    netB1.load_state_dict(torch.load(modelpath))
+    netBS.load_state_dict(torch.load(modelpath))
+    netBS1.load_state_dict(torch.load(modelpath))
     modelpath = args.output_dir_src + '/source_C.pt'    
     netC.load_state_dict(torch.load(modelpath))
-
-
-
-    
-    
+    netC1.load_state_dict(torch.load(modelpath))
+    netCS.load_state_dict(torch.load(modelpath))
+    netCS1.load_state_dict(torch.load(modelpath))
 
     netC.eval()
-    netB_S.eval()
-    netF_S.eval()
-  
-
+    netC1.eval()
+    netB1.eval()
+    netF1.eval()
+    netBS.eval()
+    netFS.eval()
+    netBS1.eval()
+    netFS1.eval()
 
     param_group = []
    
-    for k, v in netF_T.named_parameters():
+    for k, v in netF.named_parameters():
         param_group += [{'params': v, 'lr':args.lr*0.1}]
- 
-    for k, v in netB_T.named_parameters():
+    
+    for k, v in netB.named_parameters():
         param_group += [{'params': v, 'lr': args.lr}]
    
-    alpha=0.99
-  
     optimizer= optim.SGD(param_group, weight_decay=1e-3, momentum=0.9, nesterov=True)
     optimizer = op_copy(optimizer)
 
-    max_iter = args.max_epoch * len(dset_loaders["target"])
-    print(len(dset_loaders["target"]))
-    interval_iter = max_iter // args.interval
-    print('interval:',interval_iter)
+ 
+    print(len(dsets["target"]))
+   
+    
     iter_num = 0
    
-    #if iter_num % interval_iter == 0 or iter_num == max_iter:
-    tc=0.000001
-    tp=0.9
+
     start=True
-    
     epoch=0
-
-
-    while epoch <args.max_epoch:
+   
+    while epoch<8:
         epoch+=1
+        iter_num=0
+        lr_scheduler(optimizer, iter_num=epoch, max_iter=args.max_epoch)
+        while iter_num*args.batch_size < 55388:
+            try:
+                [inputs_test,inputs_testa], label, tar_idx = iter_test.next()
+            except:
+                all_list=range(55388)
         
-        netF_T.eval()
-        netB_T.eval()
-        netC.eval()
-        if  start==False:
-            tc=0.000001
-            tp=0.9
-        
-       
-        if start==True:
-            start=False
+                dset_all=Listset(dsets["target"],all_list)
+                dset_all=DataLoader(dset_all, batch_size=args.batch_size, shuffle=True, drop_last=True)
+                iter_test = iter(dset_all)
+                [inputs_test,inputs_testa], label, tar_idx = iter_test.next()
 
-            pre=copy.deepcopy(netF_T.state_dict())
-            netF1=load_network1(pre,netF1)
+            if inputs_test.size(0) == 1:
+                continue
             
-            semantics,UTR_I,UTR_D,high_risk,have_semantics,no_semantics,data_list= infer_semantics_and_obtain_UTR(dset_loaders['test'],netF_T, netB_T, netC,args)
-            semantics = semantics.cuda()
-        else:
-            
-            k_clu=max(((len(data_list)-len(high_risk))//len(have_semantics))*2,1000)
-            
-            netF1=load_network1(pre,netF1)
-            
-            semantics,UTR_I,_,high_risk,have_semantics,no_semantics,data_list= infer_semantics_and_obtain_UTR(dset_loaders['test'],netF_T, netB_T, netC,args,k=k_clu)
-          
-            semantics = semantics.cuda()
-          
-        netF_T.train()
-        netB_T.train()
-        
-
-
-        if len(high_risk)!=0:
-            dset_high_risk=Listset(dsets["target"],high_risk)
-            dset_high_risk=DataLoader(dset_high_risk, batch_size=args.batch_size//4, shuffle=True, drop_last=True)
-        
-        iter_num = 0
-        #adaptation, mixup data augmentation is used
-        while   (iter_num*(args.batch_size//4))<max(len(data_list)):
+            inputs_test = inputs_test.cuda()
             iter_num += 1
-            lr_scheduler(optimizer, iter_num=epoch, max_iter=args.max_epoch)
-            
-            try:
-                [inputs_test,inputs_testa], label, tar_idx = iter_dset.next()
-            except:
-                dset=Listset(dsets["target"],data_list)
-                dset=DataLoader(dset, batch_size=args.batch_size//4, shuffle=True, drop_last=True)
-                iter_dset = iter(dset)
-                [inputs_test,inputs_testa], label, tar_idx = iter_dset.next()
-            try:
-                [inputs_test1,inputs_test1a], label1, tar_idx1 = iter_dset1.next()
-            except:
-                data_list1=copy.deepcopy(data_list)
-                random.shuffle(data_list1)
-                dset1=Listset(dsets["target"],data_list1)
-                dset1=DataLoader(dset1, batch_size=args.batch_size//4, shuffle=True, drop_last=True)
-                iter_dset1 = iter(dset1)
-                [inputs_test1,inputs_test1a], label1, tar_idx1  = iter_dset1.next()
+
+            features_test = netB(netF(inputs_test))
+            outputs_test = netC(features_test)
+
+           
+
+            if args.ent:
+                softmax_out = nn.Softmax(dim=1)(outputs_test)
+                entropy_loss = torch.mean(loss.Entropy(softmax_out))
+                if args.gent:
+                    msoftmax = softmax_out.mean(dim=0)
+                    gentropy_loss = torch.sum(-msoftmax * torch.log(msoftmax + args.epsilon))
+                    entropy_loss -= gentropy_loss
+                im_loss = entropy_loss * args.ent_par
+               
+
+            optimizer.zero_grad()
+            im_loss.backward()
+            optimizer.step()
+         
+
+    while epoch <args.max_epoch:     
+        netF.eval()
+        netB.eval()
+        netC.eval()
+        netF1.eval()
+        netB1.eval()
+        netC1.eval()
+        lr_scheduler(optimizer, iter_num=epoch, max_iter=args.max_epoch)
+        pre=copy.deepcopy(netF.state_dict())
+        netF1=capture_unc(pre,netF1)
         
-            if inputs_test.size(0)>1 and inputs_test1.size(0)>1:
-                
-                optimizer.zero_grad()
-                
-                
-                inputs_test = inputs_test.cuda()
-                inputs_test1 = inputs_test1.cuda()
-                inputs_test1a = inputs_test1a.cuda()
-                #pseudo_label
-                with torch.no_grad():
-                    pred_u=netC(netB_T(netF_T(inputs_test1)))
-                    pred_u= nn.Softmax(dim=1)(pred_u)
-                    pred_u = pred_u**(1/0.5)
-                    targets_u = pred_u / pred_u.sum(dim=1, keepdim=True)
-                    targets_u = targets_u.detach()
-                
-                targets_x = semantics[tar_idx]
-                targets_x = torch.zeros((targets_x.size(0),12)).scatter_(1, targets_x.unsqueeze(1).cpu(), 1).cuda()
-                all_inputs = torch.cat([inputs_test, inputs_test1, inputs_test1a], dim=0)
+        mem_label,mix_set1,mix_set2,high_risk,least_num_per_class_idx,all_list  = infer_semantics_and_obtain_UTR(dset_loaders['test'], netF, netB, netC, netF1, netB1, netC1,args)
+        #print('0',len(mix_set1),mix_set1_label.shape[0])
+        
+        netF1.load_state_dict(netF.state_dict())
 
-                all_targets = torch.cat([targets_x, targets_u, targets_u], dim=0)
-                args.alpha=0.75
-                l = np.random.beta(args.alpha, args.alpha)
-
-                l = max(l, 1-l)
-
-                idx = torch.randperm(all_inputs.size(0))
-
-                input_a, input_b = all_inputs, all_inputs[idx]
-                target_a, target_b = all_targets, all_targets[idx]
-
-                mixed_input = l * input_a + (1 - l) * input_b
-                mixed_target = l * target_a + (1 - l) * target_b
-
-                mixed_input = list(torch.split(mixed_input, args.batch_size//4))
-                mixed_input = interleave(mixed_input, args.batch_size//4)
-                logits = [netC(netB_T(netF_T(mixed_input[0])))]
-                for input in mixed_input[1:]:
-                    logits.append(netC(netB_T(netF_T(input))))
-                logits = interleave(logits, args.batch_size//4)
-                logits_x = logits[0]
-                logits_u = torch.cat(logits[1:], dim=0)
-                #pdb.set_trace()
-                
-                if  logits_u.shape[0]==32 and logits_x.shape[0]==16:
-                    classifier_loss =CrossEntropy()(logits_x, mixed_target[:args.batch_size//4])
-                    classifier_loss+= CrossEntropy()(logits_u,  mixed_target[args.batch_size//4:]) #
-                    hplcloss=classifier_loss
-
-                    optimizer.zero_grad()
-                    hplcloss.backward()
-
-                    optimizer.step()
-
-               
-               
+       
+        mem_label = mem_label.cuda()
+         
+        netF.train()
+        netB.train()
+        netC.train()
+       
+        iter_hphc_num1=0
+       
+      
+    
+        mix_set1=list(set(mix_set1)|set(least_num_per_class_idx))
+          
+        
+        
+        
+        dset_all=Listset(dsets["target"],all_list)
+        dset_all=DataLoader(dset_all, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        iter_num = 0
+        while (iter_num*(args.batch_size//4))<max(len(mix_set2),len(mix_set1)):
+            iter_num += 1
             
+            if len(mix_set1)!=0 and len(mix_set2)!=0 :
+                try:
+                    [inputs_test,inputs_testa], label, tar_idx = iter_set1.next()
+                except:
+                    dset_mix_set1=Listset(dsets["target"],mix_set1)
+                    dloader_mix_set1=DataLoader(dset_mix_set1, batch_size=args.batch_size//4, shuffle=True, drop_last=True)
+                    iter_set1 = iter(dloader_mix_set1)
+                    [inputs_test,inputs_testa], label, tar_idx = iter_set1.next()
+                try:
+                    [inputs_testu,inputs_testua], labelu, tar_idxu = iter_set2.next()
+                except:
+                    dset_mix_set2=Listset(dsets["target"],mix_set2)
+                    dloader_mix_set2=DataLoader(dset_mix_set2, batch_size=args.batch_size//4, shuffle=True, drop_last=True)
+                    iter_set2 = iter(dloader_mix_set2)
+                    [inputs_testu,inputs_testua], labelu, tar_idxu  = iter_set2.next()
+         
+                if inputs_test.size(0)>1 and inputs_testu.size(0)>1:
+                    
+                    optimizer.zero_grad()
+                      
+                    inputs_test = inputs_test.cuda()
+                    
+                  
+                    inputs_testu = inputs_testu.cuda()
+                    inputs_testua = inputs_testua.cuda()
+                   
+                    with torch.no_grad():
+                        pred_u=netC(netB(netF(inputs_testu)))
+                        pred_u= nn.Softmax(dim=1)(pred_u)
+                      
+                        pred_u = pred_u**(1/0.5)
+                        targets_u = pred_u / pred_u.sum(dim=1, keepdim=True)
+                        targets_u = targets_u.detach()
+                    
+                    
+                    targets_x = mem_label[tar_idx]
+                    targets_x = torch.zeros((targets_x.size(0),12)).scatter_(1, targets_x.unsqueeze(1).cpu(), 1).cuda()
+                    #pdb.set_trace()
+                    all_inputs = torch.cat([inputs_test, inputs_testu, inputs_testua], dim=0)
+
+                    all_targets = torch.cat([targets_x, targets_u, targets_u], dim=0)
+                    args.alpha=0.75
+                    l = np.random.beta(args.alpha, args.alpha)
+
+                    l = max(l, 1-l)
+
+                    idx = torch.randperm(all_inputs.size(0))
+
+                    input_a, input_b = all_inputs, all_inputs[idx]
+                    target_a, target_b = all_targets, all_targets[idx]
+
+                    mixed_input = l * input_a + (1 - l) * input_b
+                    mixed_target = l * target_a + (1 - l) * target_b
+
+                    # interleave labeled and unlabed samples between batches to get correct batchnorm calculation 
+                    mixed_input = list(torch.split(mixed_input, args.batch_size//4))
+                    #mixed_target = list(torch.split(mixed_target, args.batch_size))
+                    mixed_input = interleave(mixed_input, args.batch_size//4)
+                    logits = [netC(netB(netF(mixed_input[0])))]
+                    for input in mixed_input[1:]:
+                        logits.append(netC(netB(netF(input))))
+                    logits = interleave(logits, args.batch_size//4)
+                    logits_x = logits[0]
+                    logits_u = torch.cat(logits[1:], dim=0)
+                    #pdb.set_trace()tar_idxhr
+                    
+                    if args.cls_par > 0  and logits_u.shape[0]==32 and logits_x.shape[0]==16:
+                        classifier_loss =CrossEntropy1()(logits_x, mixed_target[:args.batch_size//4])
+                        classifier_loss+= CrossEntropy1()(logits_u,  mixed_target[args.batch_size//4:]) #
+                    
+                        hplcloss=classifier_loss
+
+                        optimizer.zero_grad()
+                        hplcloss.backward()
+
+                        optimizer.step()
+          
+        pre=copy.deepcopy(netFS.state_dict())
+        netFS1=capture_unc(pre,netFS1)
+        pre=copy.deepcopy(netF.state_dict())
+        netF1=capture_unc(pre,netF1)
+        pre=copy.deepcopy(netB.state_dict())
+        netB1=capture_unc(pre,netB1)    
            
         iter_num=0   
-        #two calibration modules
-        while iter_num*(args.batch_size//4)<len(high_risk) or iter_num*args.batch_size<len(data_list):
+        while iter_hphc_num1*(args.batch_size//4)<len(high_risk) or iter_num*args.batch_size<len(all_list):
             iter_num+=1
             
-            if len(high_risk)!=0 and iter_num*(args.batch_size//4)<len(high_risk):
+            if len(high_risk)!=0 and iter_hphc_num1*(args.batch_size//4)<len(high_risk):
                 try:
-                    [inputs_test,inputs_testa], label, tar_idx_risk = next(iter_high_risk)
+                    [inputs_test,inputs_testa], label, tar_idxhr = next(iter_high_risk)
                 except:
                     dset_high_risk=Listset(dsets["target"],high_risk)
-                    dset_high_risk=DataLoader(dset_high_risk, batch_size=args.batch_size, shuffle=True, drop_last=False)
-                    iter_high_risk = iter((dset_high_risk))
-                    [inputs_test,inputs_testa], label, tar_idx_risk = next(iter_high_risk)
+                    dloader_high_risk=DataLoader(dset_high_risk, batch_size=args.batch_size, shuffle=True, drop_last=False)
+                    iter_high_risk = iter((dloader_high_risk))
+                    [inputs_test,inputs_testa], label, tar_idxhr = next(iter_high_risk)
                 iter_hphc_num1+=1
                 if inputs_test.size(0)>1:
-                    pred = semantics[tar_idx_risk]
+                    pred = mem_label[tar_idxhr]
                     
                     valid=torch.nonzero(pred!=-1).squeeze()
 
@@ -389,33 +419,39 @@ def train_target(args):
                    
                     inputs_test = inputs_test[valid].cuda()
     
-                    features_test = netB_T(netF_T(inputs_test))
+                    features_test = netB(netF(inputs_test))
                     outputs_test = netC(features_test)
                     
                 
-                
-                    forget_loss = args.w_forget* nn.CrossEntropyLoss()(outputs_test, pred)
+                    if args.cls_par > 0:
+                        classifier_loss = 0.9* nn.CrossEntropyLoss()(outputs_test, pred)
+                    else:
+                        classifier_loss = torch.tensor(0.0).cuda()
                  
-                    
-                    forget_loss=args.w_forget*classifier_loss
+                    hphcloss=-classifier_loss
+                
+                  
                     optimizer.zero_grad()
-                    forget_loss.backward()
+                    hphcloss.backward()
 
                     optimizer.step()
             
-            if iter_num*args.batch_size<len(data_list):
+            if len(all_list)!=0 and iter_num*args.batch_size<len(all_list):
                 try:
-                    [inputs_test,inputs_testa], label, tar_idxlp =next( iter_discover)
+                    [inputs_test,inputs_testa], label, tar_idxall =next(iter_all)
                 except:
-                    dset=Listset(dsets["target"],data_list)
-                    dset=DataLoader(dset, batch_size=args.batch_size//4, shuffle=True, drop_last=True)
-                    iter_discover = iter((dset))
-                    [inputs_test,inputs_testa], label, tar_idxlp = next(iter_discover)
-                iter_lphc_num+=1
+                    dset_all=Listset(dsets["target"],all_list)
+                    dset_all=DataLoader(dset_all, batch_size=args.batch_size, shuffle=True, drop_last=True)
+                    iter_all = iter((dset_all))
+                    [inputs_test,inputs_testa], label, tar_idxall = next(iter_all)
+                
                 if inputs_test.size(0)>1:
                     
-                    optimizer.zero_grad()          
-                    pred = semantics[tar_idxlp]       
+                    optimizer.zero_grad()
+                    #print(len(list(set(tar_idx.cpu().numpy())-set(least_num_per_class_idx))))
+                    
+                    pred = mem_label[tar_idxall]
+                    
                     valid=torch.nonzero(pred!=-2).squeeze()
 
                     if valid.shape[0]<=1:
@@ -424,59 +460,70 @@ def train_target(args):
                 
                     inputs_testa = inputs_testa[valid].cuda()
                     pred=pred[valid].cuda()
-                    features_test = netB_T(netF_T(inputs_test))
+                    features_test = netB(netF(inputs_test))
                     outputs_test = netC(features_test)
                     
-              
-                    with torch.no_grad():      
-                        features_testS = (netB_S(netF_S(inputs_test)))             
-                    kdloss =torch.nn.MSELoss(reduce=False, size_average=False)(features_test,features_testS)
-                    kdloss=torch.mean(kdloss*UTR_D) 
                     
-                   
-                    softmax_out = nn.Softmax(dim=1)(outputs_test)
-                    discover_loss = torch.mean(loss.Entropy(softmax_out))
-                    
-                    msoftmax = softmax_out.mean(dim=0)
-                    discover_loss -= torch.sum(-msoftmax * torch.log(msoftmax + 1e-5))
+                
+                    with torch.no_grad():
 
-                    discover_loss = entropy_loss 
-                 
-                    if epoch>=10:
-                        
-                        args.w_kd=0
-                    allloss=discover_loss+args.w_kd*kdloss
+                        features_testS1 =(netBS1(netFS1(inputs_test)))
+                        features_testS = (netBS(netFS(inputs_test)))
+                        UTR_D=1/4*get_mean(features_testS1,features_testS).cuda()
+                    kdloss =torch.nn.MSELoss(reduce=False, size_average=False)(features_test,features_testS)#nn.KLDivLoss(reduction='none')((features_test).log() ,features_testS )*10
                     
+                    QUTR_D=torch.sigmoid(-UTR_D)
+                    kdloss=torch.mean(kdloss*QUTR_D) 
+                    
+                    if args.ent:
+                        softmax_out = nn.Softmax(dim=1)(outputs_test)
+                        entropy_loss = torch.mean(loss.Entropy(softmax_out))
+                        if args.gent:
+                            msoftmax = softmax_out.mean(dim=0)
+                            entropy_loss -= torch.sum(-msoftmax * torch.log(msoftmax + 1e-5))
+
+                        im_loss = entropy_loss * args.ent_par
+                    
+                  
+                    if epoch<=10:
+                        x=10
+                    else:
+                        x=0
+                    allloss=im_loss+x*kdloss
+                   
                     allloss.backward()  
                     optimizer.step()
-            
-        netF_T.eval()
-        netB_T.eval()
+
+        epoch+=2
+        
+        netF.eval()
+        netB.eval()
         netC.eval()
         if args.dset=='VISDA-C':
-            acc_s_te, acc_list = cal_acc(dset_loaders['test'], netF_T, netB_T, netC, True)
-            log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name, iter_num, args.max_epoch, acc_s_te) + '\n' + acc_list
-        
+            acc_s_te, acc_list = cal_acc(dset_loaders['test'], netF, netB, netC, True)
+            log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name, epoch, args.max_epoch, acc_s_te) + '\n' + acc_list
+        else:
+            
+            acc_s_te, _ = cal_acc(dset_loaders['test'], netF, netB, netC, False)
+            log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name, epoch, args.max_epoch, acc_s_te)
 
 
         args.out_file.write(log_str + '\n')
         args.out_file.flush()
         print(log_str+'\n')
-        netF_T.train()
-        netB_T.train()
+        netF.train()
+        netB.train()
         if args.issave:
-            torch.save(netF_T.state_dict(), osp.join(args.output_dir, "target_F_" + args.savename+ str(epoch) + ".pt"))
-            torch.save(netB_T.state_dict(), osp.join(args.output_dir, "target_B_" + args.savename + str(epoch) +".pt"))
-            torch.save(netC.state_dict(), osp.join(args.output_dir, "target_C_" + args.savename + str(epoch) +".pt"))
+            torch.save(netF.state_dict(), osp.join(args.output_dir, "target_F_" + str(epoch) + ".pt"))
+            torch.save(netB.state_dict(), osp.join(args.output_dir, "target_B_"  + str(epoch) +".pt"))
+            torch.save(netC.state_dict(), osp.join(args.output_dir, "target_C_" + str(epoch) +".pt"))
 
-        
+    return netF, netB, netC
 
-    if args.issave:
-        torch.save(netF_T.state_dict(), osp.join(args.output_dir, "target_F_" + args.savename + ".pt"))
-        torch.save(netB_T.state_dict(), osp.join(args.output_dir, "target_B_" + args.savename + ".pt"))
-        torch.save(netC.state_dict(), osp.join(args.output_dir, "target_C_" + args.savename + ".pt"))
 
-    return netF_T, netB_T, netC
+
+
+
 
 
 def print_args(args):
@@ -537,6 +584,156 @@ def get_list(a,b):
     else: 
         tmp=[]
     return tmp
+def infer_semantics_and_obtain_UTR(loader,netF, netB, netC,netF1, netB1, netC1,args):
+    start_test = True
+
+
+    with torch.no_grad():
+        iter_test = iter(loader)
+        for _ in range(len(loader)):
+            data = iter_test.next()
+            inputs = data[0]
+            labels = data[1]
+            inputs = inputs.cuda()
+            feas = netB(netF(inputs))
+            
+            feas1 = netB1(netF1(inputs))
+            outputs = netC(feas)
+            outputs1 = netC1(feas1)
+            if start_test:
+                all_fea = feas.float().cpu()
+                all_output = outputs.float().cpu()
+                all_fea1 = feas1.float().cpu()
+                all_output1 = outputs1.float().cpu()
+                #all_output2 = outputs2.float().cpu()
+                all_label = labels.float().cpu()
+                start_test = False
+            else:
+                all_fea = torch.cat((all_fea, feas.float().cpu()), 0)
+                all_output = torch.cat((all_output, outputs.float().cpu()), 0)
+                all_fea1 = torch.cat((all_fea1, feas1.float().cpu()), 0)
+                all_output1 = torch.cat((all_output1, outputs1.float().cpu()), 0)
+                all_label = torch.cat((all_label, labels.float()), 0)
+                #all_output2 = torch.cat((all_output2, outputs2.float().cpu()), 0)
+    all_output = nn.Softmax(dim=1)(all_output)
+    preval, predict = torch.max(all_output, 1)
+    print('direct_all_accuracy:',torch.sum(torch.squeeze(predict).float() == all_label).item() / float(all_label.size()[0]))
+
+    UTR_I=torch.sum((all_fea-all_fea1)*(all_fea-all_fea1),dim=1)
+    
+    tc=min((UTR_I.mean())*3,UTR_I.max())
+    
+ 
+    
+    high_risk=torch.nonzero(UTR_I>tc).squeeze().cpu().numpy()
+    low_risk=torch.nonzero(UTR_I<=tc).squeeze().cpu().numpy()
+    # we split dataset 
+    set1=torch.nonzero(preval>0.9).squeeze().cpu().numpy()
+    set2=torch.nonzero(preval<=0.9).squeeze().cpu().numpy()
+    mix_set1=get_list(set1,low_risk)
+    #print(set2,high_risk,set2.shape,high_risk.shape)
+   
+    mix_set2=get_list(set2,low_risk)
+    all_list=[i for i in range(all_fea.shape[0])]
+   
+    _,predict = torch.max(all_output, 1)
+
+
+    print("UTR_I:",UTR_I.mean())
+
+    high_risk=get_list(high_risk,high_risk)
+    
+    if len(high_risk)>0:
+        print(len(high_risk))
+        print('high_risk_accuracy:',torch.sum(torch.squeeze(predict[high_risk]).float() == all_label[high_risk]).item() / float(all_label[high_risk].size()[0]))
+
+    
+    mix_set1=mix_set1
+    mix_set1_label=predict[mix_set1]
+
+    
+    least_num_per_class=100
+    semi_unlabeled_idx=list(set(set1)-set(mix_set1)-set(high_risk))
+    clu_sample=all_list
+   
+    final_label=predict
+    all_fea=all_fea[clu_sample]
+    all_output=all_output[clu_sample]
+    predict=predict[clu_sample]
+    if args.distance == 'cosine':
+        all_fea = torch.cat((all_fea, torch.ones(all_fea.size(0), 1)), 1)
+        all_fea = (all_fea.t() / torch.norm(all_fea, p=2, dim=1)).t()
+
+    all_fea = all_fea.float().cpu().numpy()
+    K = all_output.size(1)
+    aff = all_output.float().cpu().numpy()
+    initc = aff.transpose().dot(all_fea)
+    initc = initc / (1e-8 + aff.sum(axis=0)[:,None])
+    cls_count = np.eye(K)[predict].sum(axis=0)
+    labelset = np.where(cls_count>=args.threshold)
+    labelset = labelset[0]
+    # print(labelset)
+
+    dd = cdist(all_fea, initc[labelset], args.distance)
+    # for i in inset:
+    #     dd[:,i]=1
+    #pdb.set_trace()
+    least_num_dict={}
+  
+    #pdb.set_trace()
+    classes_set=list(range(12))
+    pred_label = dd.argmin(axis=1)
+    pred_label = labelset[pred_label]
+
+    for round in range(1):
+        aff = np.eye(K)[pred_label]
+        initc = aff.transpose().dot(all_fea)
+        initc = initc / (1e-8 + aff.sum(axis=0)[:,None])
+        dd = cdist(all_fea, initc[labelset], args.distance)
+        pred_label = dd.argmin(axis=1)
+        pred_label = labelset[pred_label]
+    random.shuffle(classes_set)
+    for i in classes_set:
+        #pdb.set_trace()
+        sample=np.argsort(dd[:,i])
+        #dis=np.sort(dd[:,i])
+        sample=sample[:least_num_per_class]
+        #dis=dis[:least_num_per_class]
+        if i not in least_num_dict.keys():
+            least_num_dict[i]=[]
+          
+        for idx, ix in enumerate(sample):
+            least_num_dict[i].append(clu_sample[ix])
+           
+    acc = np.sum(pred_label == all_label[clu_sample].float().numpy()) / len(all_fea)
+    log_str = 'clust Accuracy ={:.2f}%'.format( acc * 100)
+
+    args.out_file.write(log_str + '\n')
+    args.out_file.flush()
+    print(log_str)
+   
+    least_num_per_class_idx=[]
+    for i,j in enumerate(mix_set1):
+        final_label[j]=mix_set1_label[i]
+ 
+    for key,val in least_num_dict.items():
+        for i,j in enumerate(val):
+            if j not in least_num_per_class_idx:
+                least_num_per_class_idx.append(j)
+             
+                final_label[j]=key
+           
+
+    assert (final_label[semi_unlabeled_idx]==-1).sum()==0
+    assert (final_label[least_num_per_class_idx]==-1).sum()==0
+    #pdb.set_trace()
+    print('final_label_accuracy:',torch.sum(torch.squeeze(final_label).float() == all_label).item() / float(all_label.size()[0]))
+
+    final_label=final_label.cuda()
+  
+
+    
+    return final_label.long(),mix_set1,mix_set2,least_num_per_class_idx,high_risk,all_list
 
 
 
@@ -545,27 +742,31 @@ if __name__ == "__main__":
     parser.add_argument('--gpu_id', type=str, nargs='?', default='0', help="device id to run")
     parser.add_argument('--s', type=int, default=0, help="source")
     parser.add_argument('--t', type=int, default=1, help="target")
-    parser.add_argument('--max_epoch', type=int, default=10, help="max iterations")
-    parser.add_argument('--interval', type=int, default=10)
+    parser.add_argument('--max_epoch', type=int, default=40, help="max iterations")
+    parser.add_argument('--interval', type=int, default=40)
     parser.add_argument('--batch_size', type=int, default=64, help="batch_size")
     parser.add_argument('--worker', type=int, default=4, help="number of workers")
     parser.add_argument('--dset', type=str, default='VISDA-C', choices=['VISDA-C', 'office', 'office-home', 'office-caltech'])
     parser.add_argument('--lr', type=float, default=1e-3, help="learning rate")
     parser.add_argument('--net', type=str, default='resnet101', help="alexnet, vgg16, resnet50, res101")
     parser.add_argument('--seed', type=int, default=2020, help="random seed")
-
-    parser.add_argument('--threshold', type=int, default=2.5)
-    parser.add_argument('--w_kd', type=int, default=10)
-    parser.add_argument('--w_forget', type=int, default=0.9)
+ 
+    parser.add_argument('--gent', type=bool, default=True)
+    parser.add_argument('--ent', type=bool, default=True)
+    parser.add_argument('--threshold', type=int, default=0)
+    parser.add_argument('--cls_par', type=float, default=0.3)
+    parser.add_argument('--ent_par', type=float, default=1.0)
     parser.add_argument('--lr_decay1', type=float, default=0.1)
+    parser.add_argument('--lr_decay2', type=float, default=1.0)
+
     parser.add_argument('--bottleneck', type=int, default=256)
     parser.add_argument('--epsilon', type=float, default=1e-5)
     parser.add_argument('--layer', type=str, default="wn", choices=["linear", "wn"])
     parser.add_argument('--classifier', type=str, default="bn", choices=["ori", "bn"])
     parser.add_argument('--distance', type=str, default='cosine', choices=["euclidean", "cosine"])  
-    parser.add_argument('--output', type=str, default='ckps/target/visda')
-    parser.add_argument('--output_src', type=str, default='ckps/source')
-    parser.add_argument('--da', type=str, default='uda', choices=['uda', 'pda'])
+    parser.add_argument('--output', type=str, default='ckps/target/mixvis')
+    parser.add_argument('--output_src', type=str, default='ckps')
+    #parser.add_argument('--da', type=str, default='uda', choices=['uda', 'pda'])
     parser.add_argument('--issave', type=bool, default=True)
     args = parser.parse_args()
 
@@ -596,27 +797,22 @@ if __name__ == "__main__":
             continue
         args.t = i
 
-        folder = './data'
+        folder = '/home/spi/peijiangbo/'
         args.s_dset_path = folder + args.dset + '/' + names[args.s] + '_list.txt'
         args.t_dset_path = folder + args.dset + '/' + names[args.t] + '_list.txt'
         args.test_dset_path = folder + args.dset + '/' + names[args.t] + '_list.txt'
 
-        if args.dset == 'office-home':
-            if args.da == 'pda':
-                args.class_num = 65
-                args.src_classes = [i for i in range(65)]
-                args.tar_classes = [i for i in range(25)]
+            
 
-        args.output_dir_src = osp.join(args.output_src, args.da, args.dset, names[args.s][0].upper())
-        args.output_dir = osp.join(args.output, args.da, args.dset, names[args.s][0].upper()+names[args.t][0].upper())
+        args.output_dir_src = osp.join(args.output_src, args.dset, names[args.s][0].upper())
+        args.output_dir = osp.join(args.output, args.dset, names[args.s][0].upper()+names[args.t][0].upper())
         args.name = names[args.s][0].upper()+names[args.t][0].upper()
 
         if not osp.exists(args.output_dir):
             os.system('mkdir -p ' + args.output_dir)
         if not osp.exists(args.output_dir):
             os.mkdir(args.output_dir)
-        
-        copyfile('./six_visda.py', f'./{args.output_dir}/six_visda.py')
+        from shutil import copyfile
         args.savename = 'par_' + str(args.cls_par)
         
         args.out_file = open(osp.join(args.output_dir, 'log_' + args.savename + '.txt'), 'w')
