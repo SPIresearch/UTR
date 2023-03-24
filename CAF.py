@@ -284,7 +284,7 @@ def train_target(args):
         netF1=capture_unc(pre,netF1)
         
         mem_label,mix_set1,mix_set2,high_risk,least_num_per_class_idx,all_list  = infer_semantics_and_obtain_UTR(dset_loaders['test'], netF, netB, netC, netF1, netB1, netC1,args)
-        #print('0',len(mix_set1),mix_set1_label.shape[0])
+        
         
         netF1.load_state_dict(netF.state_dict())
 
@@ -605,7 +605,7 @@ def infer_semantics_and_obtain_UTR(loader,netF, netB, netC,netF1, netB1, netC1,a
                 all_output = outputs.float().cpu()
                 all_fea1 = feas1.float().cpu()
                 all_output1 = outputs1.float().cpu()
-                #all_output2 = outputs2.float().cpu()
+              
                 all_label = labels.float().cpu()
                 start_test = False
             else:
@@ -627,12 +627,11 @@ def infer_semantics_and_obtain_UTR(loader,netF, netB, netC,netF1, netB1, netC1,a
     
     high_risk=torch.nonzero(UTR_I>tc).squeeze().cpu().numpy()
     low_risk=torch.nonzero(UTR_I<=tc).squeeze().cpu().numpy()
-    # we split dataset 
+    # we split low-risk set into two subsets for mixup
     set1=torch.nonzero(preval>0.9).squeeze().cpu().numpy()
     set2=torch.nonzero(preval<=0.9).squeeze().cpu().numpy()
     mix_set1=get_list(set1,low_risk)
-    #print(set2,high_risk,set2.shape,high_risk.shape)
-   
+  
     mix_set2=get_list(set2,low_risk)
     all_list=[i for i in range(all_fea.shape[0])]
    
@@ -643,15 +642,13 @@ def infer_semantics_and_obtain_UTR(loader,netF, netB, netC,netF1, netB1, netC1,a
 
     high_risk=get_list(high_risk,high_risk)
     
-    if len(high_risk)>0:
-        print(len(high_risk))
-        print('high_risk_accuracy:',torch.sum(torch.squeeze(predict[high_risk]).float() == all_label[high_risk]).item() / float(all_label[high_risk].size()[0]))
-
+    
     
     mix_set1=mix_set1
     mix_set1_label=predict[mix_set1]
 
-    
+    # using the pseudo-label strategy of SHOT
+    # there may be some classes that are assigned few samples. to avoid it, we set a least_num_per_class.
     least_num_per_class=100
     semi_unlabeled_idx=list(set(set1)-set(mix_set1)-set(high_risk))
     clu_sample=all_list
@@ -672,12 +669,10 @@ def infer_semantics_and_obtain_UTR(loader,netF, netB, netC,netF1, netB1, netC1,a
     cls_count = np.eye(K)[predict].sum(axis=0)
     labelset = np.where(cls_count>=args.threshold)
     labelset = labelset[0]
-    # print(labelset)
+   
 
     dd = cdist(all_fea, initc[labelset], args.distance)
-    # for i in inset:
-    #     dd[:,i]=1
-    #pdb.set_trace()
+   
     least_num_dict={}
   
     #pdb.set_trace()
@@ -724,10 +719,7 @@ def infer_semantics_and_obtain_UTR(loader,netF, netB, netC,netF1, netB1, netC1,a
                 final_label[j]=key
            
 
-    assert (final_label[semi_unlabeled_idx]==-1).sum()==0
-    assert (final_label[least_num_per_class_idx]==-1).sum()==0
-    #pdb.set_trace()
-    print('final_label_accuracy:',torch.sum(torch.squeeze(final_label).float() == all_label).item() / float(all_label.size()[0]))
+  
 
     final_label=final_label.cuda()
   
